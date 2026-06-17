@@ -80,6 +80,20 @@ spec:
             solverName: alidns-solver
 ```
 
+The `config.service` field is optional and defaults to `alidns`. To use ESA records instead, set `service: esa`:
+
+```
+config:
+  service: esa
+  accessTokenSecretRef:
+    key: access-token
+    name: alidns-secrets
+  regionId: cn-beijing
+  secretKeySecretRef:
+    key: secret-key
+    name: alidns-secrets
+```
+
 See cert-manager documentation for more information : https://cert-manager.io/docs/configuration/acme/dns01/
 
 ### Create the certification

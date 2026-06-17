@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	alidns "github.com/alibabacloud-go/alidns-20150109/client"
 	openapi "github.com/alibabacloud-go/darabonba-openapi/client"
+	openapiv2 "github.com/alibabacloud-go/darabonba-openapi/v2/utils"
+	esa "github.com/alibabacloud-go/esa-20240910/v3/client"
 	"github.com/alibabacloud-go/tea/tea"
-
-	"os"
-	"strings"
 
 	"github.com/pkg/errors"
 
@@ -55,6 +56,7 @@ type aliDNSProviderSolver struct {
 	//    assigned to it for interacting with the Kubernetes APIs you need.
 	client       *kubernetes.Clientset
 	aliDNSClient *alidns.Client
+	esaClient    *esa.Client
 }
 
 // customDNSProviderConfig is a structure that is used to decode into when
@@ -80,6 +82,7 @@ type aliDNSProviderConfig struct {
 	AccessToken cmmetav1.SecretKeySelector `json:"accessTokenSecretRef"`
 	SecretToken cmmetav1.SecretKeySelector `json:"secretKeySecretRef"`
 	Regionid    string                     `json:"regionId"`
+	Service     string                     `json:"service"`
 }
 
 // Name is used as the name for this DNS solver when referencing it on the ACME
@@ -115,6 +118,17 @@ func (c *aliDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return err
 	}
 
+	switch cfg.service() {
+	case "alidns":
+		return c.presentAliDNS(cfg, accessToken, secretKey, ch)
+	case "esa":
+		return c.presentESA(cfg, accessToken, secretKey, ch)
+	default:
+		return fmt.Errorf("unsupported dns service %q", cfg.Service)
+	}
+}
+
+func (c *aliDNSProviderSolver) presentAliDNS(cfg aliDNSProviderConfig, accessToken, secretKey []byte, ch *v1alpha1.ChallengeRequest) error {
 	client, err := alidns.NewClient(&openapi.Config{
 		AccessKeyId:     tea.String(string(accessToken)),
 		AccessKeySecret: tea.String(string(secretKey)),
@@ -125,16 +139,47 @@ func (c *aliDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	}
 	c.aliDNSClient = client
 
-	zoneName, err := c.getHostedZone(ch.ResolvedZone)
+	zoneName, err := c.getAliDNSHostedZone(ch.ResolvedZone)
 	if err != nil {
 		return fmt.Errorf("alicloud: error getting hosted zones: %v", err)
 	}
 
-	recordAttributes := c.newTxtRecord(zoneName, ch.ResolvedFQDN, ch.Key)
+	recordAttributes := c.newAliDNSTxtRecord(zoneName, ch.ResolvedFQDN, ch.Key)
 
 	_, err = c.aliDNSClient.AddDomainRecord(recordAttributes)
 	if err != nil {
 		return fmt.Errorf("alicloud: error adding domain record: %v", err)
+	}
+	return nil
+}
+
+func (c *aliDNSProviderSolver) presentESA(cfg aliDNSProviderConfig, accessToken, secretKey []byte, ch *v1alpha1.ChallengeRequest) error {
+	client, err := esa.NewClient(&openapiv2.Config{
+		AccessKeyId:     tea.String(string(accessToken)),
+		AccessKeySecret: tea.String(string(secretKey)),
+		RegionId:        tea.String(cfg.Regionid),
+	})
+	if err != nil {
+		return err
+	}
+	c.esaClient = client
+
+	siteID, err := c.getESASiteID(ch.ResolvedZone)
+	if err != nil {
+		return fmt.Errorf("esa: error getting site id: %v", err)
+	}
+
+	_, err = c.esaClient.CreateRecord(&esa.CreateRecordRequest{
+		SiteId:     tea.Int64(siteID),
+		RecordName: tea.String(util.UnFqdn(ch.ResolvedFQDN)),
+		Type:       tea.String("TXT"),
+		Ttl:        tea.Int32(1),
+		Data: &esa.CreateRecordRequestData{
+			Value: tea.String(ch.Key),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("esa: error adding dns record: %v", err)
 	}
 	return nil
 }
@@ -146,12 +191,47 @@ func (c *aliDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 // This is in order to facilitate multiple DNS validations for the same domain
 // concurrently.
 func (c *aliDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	records, err := c.findTxtRecords(ch.ResolvedZone, ch.ResolvedFQDN)
+	cfg, err := loadConfig(ch.Config)
+	if err != nil {
+		return err
+	}
+
+	accessToken, err := c.loadSecretData(cfg.AccessToken, ch.ResourceNamespace)
+	if err != nil {
+		return err
+	}
+	secretKey, err := c.loadSecretData(cfg.SecretToken, ch.ResourceNamespace)
+	if err != nil {
+		return err
+	}
+
+	switch cfg.service() {
+	case "alidns":
+		return c.cleanUpAliDNS(cfg, accessToken, secretKey, ch)
+	case "esa":
+		return c.cleanUpESA(cfg, accessToken, secretKey, ch)
+	default:
+		return fmt.Errorf("unsupported dns service %q", cfg.Service)
+	}
+}
+
+func (c *aliDNSProviderSolver) cleanUpAliDNS(cfg aliDNSProviderConfig, accessToken, secretKey []byte, ch *v1alpha1.ChallengeRequest) error {
+	client, err := alidns.NewClient(&openapi.Config{
+		AccessKeyId:     tea.String(string(accessToken)),
+		AccessKeySecret: tea.String(string(secretKey)),
+		RegionId:        tea.String(cfg.Regionid),
+	})
+	if err != nil {
+		return err
+	}
+	c.aliDNSClient = client
+
+	records, err := c.findAliDNSTxtRecords(ch.ResolvedZone, ch.ResolvedFQDN)
 	if err != nil {
 		return fmt.Errorf("alicloud: error finding txt records: %v", err)
 	}
 
-	_, err = c.getHostedZone(ch.ResolvedZone)
+	_, err = c.getAliDNSHostedZone(ch.ResolvedZone)
 	if err != nil {
 		return fmt.Errorf("alicloud: %v", err)
 	}
@@ -165,6 +245,44 @@ func (c *aliDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 			if err != nil {
 				return fmt.Errorf("alicloud: error deleting domain record: %v", err)
 			}
+		}
+	}
+	return nil
+}
+
+func (c *aliDNSProviderSolver) cleanUpESA(cfg aliDNSProviderConfig, accessToken, secretKey []byte, ch *v1alpha1.ChallengeRequest) error {
+	client, err := esa.NewClient(&openapiv2.Config{
+		AccessKeyId:     tea.String(string(accessToken)),
+		AccessKeySecret: tea.String(string(secretKey)),
+		RegionId:        tea.String(cfg.Regionid),
+	})
+	if err != nil {
+		return err
+	}
+	c.esaClient = client
+
+	siteID, err := c.getESASiteID(ch.ResolvedZone)
+	if err != nil {
+		return fmt.Errorf("esa: error getting site id: %v", err)
+	}
+
+	records, err := c.findESATxtRecords(siteID, ch.ResolvedFQDN)
+	if err != nil {
+		return fmt.Errorf("esa: error finding txt records: %v", err)
+	}
+
+	for _, rec := range records {
+		if rec == nil || rec.RecordId == nil || rec.Data == nil {
+			continue
+		}
+		if ch.Key != tea.StringValue(rec.Data.Value) {
+			continue
+		}
+		_, err = c.esaClient.DeleteRecord(&esa.DeleteRecordRequest{
+			RecordId: rec.RecordId,
+		})
+		if err != nil {
+			return fmt.Errorf("esa: error deleting dns record: %v", err)
 		}
 	}
 	return nil
@@ -205,7 +323,14 @@ func loadConfig(cfgJSON *extapi.JSON) (aliDNSProviderConfig, error) {
 	return cfg, nil
 }
 
-func (c *aliDNSProviderSolver) getHostedZone(resolvedZone string) (string, error) {
+func (cfg aliDNSProviderConfig) service() string {
+	if cfg.Service == "" {
+		return "alidns"
+	}
+	return strings.ToLower(cfg.Service)
+}
+
+func (c *aliDNSProviderSolver) getAliDNSHostedZone(resolvedZone string) (string, error) {
 	request := &alidns.DescribeDomainsRequest{}
 
 	var domains []string
@@ -250,7 +375,7 @@ func (c *aliDNSProviderSolver) getHostedZone(resolvedZone string) (string, error
 	return hostedZone, nil
 }
 
-func (c *aliDNSProviderSolver) newTxtRecord(zone, fqdn, value string) *alidns.AddDomainRecordRequest {
+func (c *aliDNSProviderSolver) newAliDNSTxtRecord(zone, fqdn, value string) *alidns.AddDomainRecordRequest {
 	return &alidns.AddDomainRecordRequest{
 		Type:       tea.String("TXT"),
 		DomainName: tea.String(zone),
@@ -259,8 +384,8 @@ func (c *aliDNSProviderSolver) newTxtRecord(zone, fqdn, value string) *alidns.Ad
 	}
 }
 
-func (c *aliDNSProviderSolver) findTxtRecords(domain string, fqdn string) ([]*alidns.DescribeDomainRecordsResponseBodyDomainRecordsRecord, error) {
-	zoneName, err := c.getHostedZone(domain)
+func (c *aliDNSProviderSolver) findAliDNSTxtRecords(domain string, fqdn string) ([]*alidns.DescribeDomainRecordsResponseBodyDomainRecordsRecord, error) {
+	zoneName, err := c.getAliDNSHostedZone(domain)
 	if err != nil {
 		return nil, err
 	}
@@ -288,6 +413,70 @@ func (c *aliDNSProviderSolver) findTxtRecords(domain string, fqdn string) ([]*al
 		}
 	}
 	return records, nil
+}
+
+func (c *aliDNSProviderSolver) findESATxtRecords(siteID int64, fqdn string) ([]*esa.ListRecordsResponseBodyRecords, error) {
+	request := &esa.ListRecordsRequest{
+		SiteId:          tea.Int64(siteID),
+		RecordName:      tea.String(util.UnFqdn(fqdn)),
+		RecordMatchType: tea.String("exact"),
+		Type:            tea.String("TXT"),
+		PageSize:        tea.Int32(500),
+	}
+
+	var records []*esa.ListRecordsResponseBodyRecords
+	pageNumber := int32(1)
+	for {
+		request.PageNumber = tea.Int32(pageNumber)
+
+		result, err := c.esaClient.ListRecords(request)
+		if err != nil {
+			return records, err
+		}
+		if result == nil || result.Body == nil {
+			return records, nil
+		}
+
+		records = append(records, result.Body.Records...)
+
+		pageSize := int32(500)
+		if result.Body.PageSize != nil {
+			pageSize = *result.Body.PageSize
+		}
+		totalCount := int32(len(records))
+		if result.Body.TotalCount != nil {
+			totalCount = *result.Body.TotalCount
+		}
+		if pageNumber*pageSize >= totalCount {
+			break
+		}
+		pageNumber++
+	}
+	return records, nil
+}
+
+func (c *aliDNSProviderSolver) getESASiteID(resolvedZone string) (int64, error) {
+	siteName := util.UnFqdn(resolvedZone)
+	result, err := c.esaClient.ListSites(&esa.ListSitesRequest{
+		SiteName:       tea.String(siteName),
+		SiteSearchType: tea.String("exact"),
+		PageSize:       tea.Int32(2),
+	})
+	if err != nil {
+		return 0, err
+	}
+	if result == nil || result.Body == nil || len(result.Body.Sites) == 0 {
+		return 0, fmt.Errorf("site %s not found", siteName)
+	}
+	if len(result.Body.Sites) > 1 || (result.Body.TotalCount != nil && *result.Body.TotalCount > 1) {
+		return 0, fmt.Errorf("site %s matched multiple sites", siteName)
+	}
+	for _, site := range result.Body.Sites {
+		if site != nil && site.SiteId != nil {
+			return *site.SiteId, nil
+		}
+	}
+	return 0, fmt.Errorf("site %s has no site id", siteName)
 }
 
 func (c *aliDNSProviderSolver) extractRecordName(fqdn, domain string) string {
